@@ -1,0 +1,500 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Nov 11 19:21:16 2025
+
+@author: AndrejSumShik
+"""
+
+# -*- coding: utf-8 -*-
+"""
+QConvFourChannel3q + Bias-Head tweak:
+- Adds a bias ancilla qubit prepared in |+>
+- Applies three controlled-Ry rotations from the bias ancilla to the 3 readout qubits
+- Uses your best hyperparameters to run a single training job (no Optuna)
+"""
+
+import os, time, math, gc, json, numpy as np
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision.datasets import KMNIST
+
+# ---------- Optional optimizers ----------
+try:
+    from lion_pytorch import Lion as LionOpt
+except Exception:
+    LionOpt = None
+
+# ---------------- Device ----------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ---------------- Fixed training knobs ----------------
+classes = list(range(8))
+MAX_PER_CLASS = 2000
+max_epochs = 50
+eps       = 1e-8
+grad_clip = 5.0
+simulate_shots = True
+
+# ---------------- Qubit layout (NOW TOTAL = 17) ----------------
+# Data channels: 4 groups of 3 = 12 data qubits (0..11)
+# Channel ancillas: 4 ancillas (12,13,14,15); readout uses last three (13,14,15)
+# NEW bias ancilla: 16
+CH_DATA = [
+    [0,1,2], [3,4,5], [6,7,8], [9,10,11],
+]
+CH_ANC  = [12,13,14,15]           # per-channel ancillae
+ANC_LIST = CH_ANC                  # ancilla head acts on all 4 channel ancillas
+ANC_LABEL = [CH_ANC[1], CH_ANC[2], CH_ANC[3]]  # readout qubits (k = 3)
+NQ = 17
+BIAS_Q = 16
+
+# ---------------- Gates & core ops ----------------
+def hadamard_2(device=device):
+    m = torch.tensor([[1.0,  1.0],[1.0, -1.0]], dtype=torch.float32, device=device) / math.sqrt(2.0)
+    return m.to(torch.complex64)
+H2 = hadamard_2()
+
+def ry_matrix(angle):
+    c = torch.cos(angle / 2.0)
+    s = torch.sin(angle / 2.0)
+    M = torch.stack([torch.stack([c, -s], dim=-1),
+                     torch.stack([s,  c], dim=-1)], dim=-2)
+    return M.to(torch.complex64)
+
+def rz_matrix(angle):
+    half = angle / 2.0
+    c = torch.cos(half); s = torch.sin(half)
+    e_minus = torch.complex(c, -s); e_plus = torch.complex(c, s)
+    z = torch.zeros_like(c, dtype=torch.complex64)
+    return torch.stack([torch.stack([e_minus, z], dim=-1),
+                        torch.stack([z,      e_plus], dim=-1)], dim=-2)
+
+CNOT_2 = torch.tensor([[1,0,0,0],
+                       [0,1,0,0],
+                       [0,0,0,1],
+                       [0,0,1,0]], dtype=torch.float32, device=device).to(torch.complex64)
+
+def _permute_targets_last(state, n, target_axes):
+    batch = state.shape[0]
+    t = state.view(batch, *([2]*n))
+    axes = [0] + [a+1 for a in range(n) if a not in target_axes] + [a+1 for a in target_axes]
+    tperm = t.permute(*axes).contiguous()
+    leading = tperm.shape[1:-len(target_axes)] if len(target_axes)>0 else tperm.shape[1:]
+    V = 1
+    for d in leading: V *= d
+    return tperm, V, leading, axes
+
+def _invert_axes(axes, n):
+    inv = [0]*(n+1)
+    for i,a in enumerate(axes): inv[a] = i
+    return inv
+
+def apply_single_qubit_gate(state, n, q, G2):
+    tperm, V, leading, axes = _permute_targets_last(state, n, [q])
+    tflat = tperm.view(state.shape[0], V, 2)
+    out = torch.einsum('bvi,ij->bvj', tflat, G2.to(tflat.device))
+    out = out.view(*tperm.shape)
+    inv = _invert_axes(axes, n)
+    out = out.permute(*inv).contiguous()
+    return out.view(state.shape[0], -1)
+
+def apply_two_qubit_gate(state, n, q1, q2, G4):
+    tperm, V, leading, axes = _permute_targets_last(state, n, [q1,q2])
+    tflat = tperm.view(state.shape[0], V, 4)
+    out = torch.einsum('bvf,fg->bvg', tflat, G4.to(tflat.device))
+    out = out.view(*tperm.shape)
+    inv = _invert_axes(axes, n)
+    out = out.permute(*inv).contiguous()
+    return out.view(state.shape[0], -1)
+
+def apply_controlled_single(state, n, qc, q, G2):
+    tperm, V, leading, axes = _permute_targets_last(state, n, [qc, q])
+    t4 = tperm.view(state.shape[0], V, 2, 2)
+    ctrl1 = t4[:,:,1,:]
+    out1 = torch.einsum('bvi,ij->bvj', ctrl1, G2.to(ctrl1.device))
+    t4 = torch.stack([t4[:,:,0,:], out1], dim=2)
+    out = t4.view(*tperm.shape)
+    inv = _invert_axes(axes, n)
+    out = out.permute(*inv).contiguous()
+    return out.view(state.shape[0], -1)
+
+def apply_controlled_two(state, n, qc, q1, q2, G4):
+    tperm, V, leading, axes = _permute_targets_last(state, n, [qc, q1, q2])
+    t5 = tperm.view(state.shape[0], V, 2, 2, 2)
+    ctrl1 = t5[:,:,1,:,:].contiguous().view(state.shape[0], V, 4)
+    out1 = torch.einsum('bvf,fg->bvg', ctrl1, G4.to(ctrl1.device))
+    out1 = out1.view(state.shape[0], V, 2, 2)
+    t5 = torch.stack([t5[:,:,0,:,:], out1], dim=2)
+    out = t5.view(*tperm.shape)
+    inv = _invert_axes(axes, n)
+    out = out.permute(*inv).contiguous()
+    return out.view(state.shape[0], -1)
+
+def apply_controlled_multi(state, n, qc, q_list, U):
+    k = len(q_list)
+    tperm, V, leading, axes = _permute_targets_last(state, n, [qc] + q_list)
+    t = tperm.view(state.shape[0], V, 2, 2**k)      # [B, V, 2, 2**k]
+    ctrl1 = t[:, :, 1, :]                           # [B, V, 2**k]
+    Uc = U.to(ctrl1.device, dtype=torch.complex64)  # ensure complex64
+    out1 = torch.einsum('bvd,bdf->bvf', ctrl1, Uc)
+    t = torch.stack([t[:, :, 0, :], out1], dim=2)
+    out = t.view(*tperm.shape)
+    inv = _invert_axes(axes, n)
+    out = out.permute(*inv).contiguous()
+    return out.view(state.shape[0], -1)
+
+def ry_layer(state, n, q_list, thetas, qc=None):
+    s = state
+    for qi, ang in zip(q_list, thetas):
+        G = ry_matrix(ang)
+        if qc is None:
+            s = apply_single_qubit_gate(s, n, qi, G)
+        else:
+            s = apply_controlled_single(s, n, qc, qi, G)
+    return s
+
+def rz_layer(state, n, q_list, thetas, qc=None):
+    s = state
+    for qi, ang in zip(q_list, thetas):
+        G = rz_matrix(ang)
+        if qc is None:
+            s = apply_single_qubit_gate(s, n, qi, G)
+        else:
+            s = apply_controlled_single(s, n, qc, qi, G)
+    return s
+
+def ring_cnot_layer(state, n, q_list, qc=None, forward=True):
+    s = state
+    L = len(q_list)
+    for i in range(L):
+        c = q_list[i] if forward else q_list[(i+1) % L]
+        t = q_list[(i+1) % L] if forward else q_list[i]
+        if qc is None:
+            s = apply_two_qubit_gate(s, n, c, t, CNOT_2)
+        else:
+            s = apply_controlled_two(s, n, qc, c, t, CNOT_2)
+    return s
+
+def householder_Ux(x_vec):
+    B, D = x_vec.shape
+    I = torch.eye(D, dtype=torch.float32, device=x_vec.device).unsqueeze(0).expand(B, D, D)
+    e0 = torch.zeros(B, D, dtype=torch.float32, device=x_vec.device); e0[:,0] = 1.0
+    u = (e0 - x_vec)
+    denom = torch.clamp(torch.norm(u, dim=1, keepdim=True), min=1e-12)
+    u = u / denom
+    H = I - 2.0 * u.unsqueeze(2) * u.unsqueeze(1)  # [B,D,D], real
+    return H.to(torch.complex64)
+
+def normalize_vecs(x):
+    n = torch.linalg.norm(x, dim=1, keepdim=True)
+    n = torch.where(n > 0, n, torch.ones_like(n))
+    return x / n
+
+# ---------------- Model (adds bias-head parameters) ----------------
+class QConvFourChannel3q_Bias(nn.Module):
+    def __init__(self, M_ch=10, M_anc=20, ent_pattern="cw_fixed",
+                 use_rz_anc=True, rz_period=20, device=device):
+        super().__init__()
+        self.device = device
+        self.M_ch = M_ch
+        self.M_anc = M_anc
+        self.ent_pattern = ent_pattern
+        self.use_rz_anc = use_rz_anc
+        self.rz_period = max(5, int(rz_period))
+
+        # Classical front
+        self.conv = nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=True)
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool2d((2,4))
+
+        # Trainable quantum blocks
+        self.theta_ch  = nn.Parameter(
+            torch.randn((4, 4, M_ch+1, 3), dtype=torch.float32, device=device) * 0.08
+        )
+        self.theta_anc = nn.Parameter(
+            torch.randn((M_anc+1, len(ANC_LIST)), dtype=torch.float32, device=device) * 0.08
+        )
+        if self.use_rz_anc:
+            self.theta_anc_z = nn.Parameter(
+                torch.randn((M_anc+1, len(ANC_LIST)), dtype=torch.float32, device=device) * 0.08
+            )
+        else:
+            self.register_parameter('theta_anc_z', None)
+
+        # NEW: 3 learnable angles for bias-head controlled R_y on 3 readout qubits
+        self.theta_bias = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=device))
+
+        # Softmax head parameters
+        self.beta = nn.Parameter(torch.tensor(1.5, dtype=torch.float32, device=device))
+        self.logit_bias = nn.Parameter(torch.zeros(8, dtype=torch.float32, device=device))
+
+        with torch.no_grad():
+            self.conv.weight.mul_(0.1)
+            if self.conv.bias is not None:
+                self.conv.bias.zero_()
+            # tiny init for bias thetas
+            self.theta_bias.add_(0.05 * torch.randn_like(self.theta_bias))
+
+    def _apply_Uw_block(self, state, q_list, thetas_block, qc=None, allow_alt=False):
+        s = state
+        M = thetas_block.shape[0] - 1
+        for d in range(M):
+            s = ry_layer(s, NQ, q_list, thetas_block[d], qc)
+            forward = True
+            if allow_alt and (self.ent_pattern == "cw_ccw_alternating"):
+                forward = (d % 2 == 0)
+            s = ring_cnot_layer(s, NQ, q_list, qc, forward=forward)
+        s = ry_layer(s, NQ, q_list, thetas_block[-1], qc)
+        return s
+
+    def _apply_ancilla_head(self, state):
+        s = state
+        M = self.theta_anc.shape[0] - 1
+        for d in range(M):
+            s = ry_layer(s, NQ, ANC_LIST, self.theta_anc[d], qc=None)
+            if self.use_rz_anc and ((d + 1) % self.rz_period == 0):
+                s = rz_layer(s, NQ, ANC_LIST, self.theta_anc_z[d], qc=None)
+            forward = True
+            if self.ent_pattern == "cw_ccw_alternating":
+                forward = (d % 2 == 0)
+            s = ring_cnot_layer(s, NQ, ANC_LIST, qc=None, forward=forward)
+        s = ry_layer(s, NQ, ANC_LIST, self.theta_anc[-1], qc=None)
+        if self.use_rz_anc and ((M + 1) % self.rz_period == 0):
+            s = rz_layer(s, NQ, ANC_LIST, self.theta_anc_z[-1], qc=None)
+        return s
+
+    def forward(self, imgs16):
+        B = imgs16.shape[0]
+        x = imgs16.to(self.device)
+
+        feats = self.pool(self.relu(self.conv(x)))   # [B,16,2,4]
+
+        state = torch.zeros(B, 2**NQ, dtype=torch.complex64, device=self.device)
+        state[:, 0] = 1.0 + 0.0j
+
+        # 4 channels
+        for ch in range(4):
+            q_data = CH_DATA[ch]
+            q_anc  = CH_ANC[ch]
+            base = 4 * ch
+            vec_idxs = [base + i for i in range(4)]
+
+            Ux_list = []
+            for i in range(4):
+                v = feats[:, vec_idxs[i], :, :].reshape(B, 8)
+                v = normalize_vecs(v)
+                Ux = householder_Ux(v)              # [B,8,8], real → complex64 later
+                Ux_list.append(Ux)
+
+            # put channel ancilla into |+>
+            state = apply_single_qubit_gate(state, NQ, q_anc, H2)
+
+            # 4 amplitude-encodes + controlled Uw blocks
+            for i in range(4):
+                state = apply_controlled_multi(state, NQ, q_anc, q_data, Ux_list[i].transpose(1,2))
+                thetas_block = self.theta_ch[ch, i]
+                state = self._apply_Uw_block(state, q_list=q_data, thetas_block=thetas_block, qc=q_anc, allow_alt=True)
+
+            # close with H on channel ancilla
+            state = apply_single_qubit_gate(state, NQ, q_anc, H2)
+
+        # ancilla head over the 4 channel ancillas
+        state = self._apply_ancilla_head(state)
+
+        # ---------- NEW BIAS HEAD ----------
+        # Prepare bias ancilla in |+>
+        state = apply_single_qubit_gate(state, NQ, BIAS_Q, H2)
+        # Apply 3 controlled Ry from bias to the 3 readout qubits (ANC_LABEL)
+        for idx, q_read in enumerate(ANC_LABEL):
+            G = ry_matrix(self.theta_bias[idx])
+            state = apply_controlled_single(state, NQ, BIAS_Q, q_read, G)
+        # -----------------------------------
+
+        # Measure probabilities on the 3 readout qubits (ANC_LABEL)
+        t = state.view(B, *([2]*NQ))
+        B_axes = [a+1 for a in ANC_LABEL]  # positions in the view
+        keep = [a for a in range(1, NQ+1) if a not in B_axes]
+        tperm = t.permute(0, *keep, *B_axes).contiguous()
+        rest = int(np.prod(tperm.shape[1:-3])) if tperm.dim()>4 else 1
+        tflat = tperm.view(B, rest, 2, 2, 2)
+        probs_B = (tflat.abs()**2).sum(dim=1).reshape(B, 8)   # class probabilities
+        return probs_B
+
+# ---------------- Data ----------------
+def center_crop_16x16(imgs28_np):
+    return imgs28_np.reshape(-1, 28, 28)[:, 6:22, 6:22].astype(np.float32)
+
+def make_dataloaders(batch_size=64, max_per_class=2000, classes=list(range(8))):
+    rng = np.random.default_rng(42)
+    train_raw = KMNIST(root='./data', train=True, download=True)
+    X_train = train_raw.data.numpy().astype(np.float32)
+    y_train = train_raw.targets.numpy()
+    mask_tr = np.isin(y_train, classes)
+    X_train = X_train[mask_tr]; y_train = y_train[mask_tr]
+
+    idxs = []
+    for c in classes:
+        pool = np.where(y_train == c)[0]
+        pick = rng.choice(pool, min(max_per_class, pool.size), replace=False)
+        idxs.append(pick)
+    train_idxs = np.concatenate(idxs)
+    X_train = X_train[train_idxs]; y_train = y_train[train_idxs]
+
+    test_raw = KMNIST(root='./data', train=False, download=True)
+    X_test = test_raw.data.numpy().astype(np.float32)
+    y_test = test_raw.targets.numpy()
+    mask_te = np.isin(y_test, classes)
+    X_test = X_test[mask_te]; y_test = y_test[mask_te]
+
+    Xtr16 = center_crop_16x16(X_train)
+    Xte16 = center_crop_16x16(X_test)
+
+    Xtr_t = torch.from_numpy(Xtr16).unsqueeze(1)  # [N,1,16,16]
+    Xte_t = torch.from_numpy(Xte16).unsqueeze(1)
+
+    train_ds = TensorDataset(Xtr_t, torch.tensor(y_train, dtype=torch.long))
+    test_ds  = TensorDataset(Xte_t, torch.tensor(y_test,  dtype=torch.long))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, pin_memory=True)
+    return train_loader, test_loader
+
+# ---------------- STE, shot model, entropy ----------------
+def ste(noisy, clean):
+    return clean + (noisy - clean).detach()
+
+def _renorm_rows(P, eps=1e-12):
+    Z = P.sum(dim=1, keepdim=True).clamp_min(eps)
+    return (P / Z).clamp_min(eps)
+
+@torch.no_grad()
+def apply_shot_noise_to_probs(P, shots, eps=1e-12):
+    Pn = _renorm_rows(P, eps=eps)
+    counts = torch.distributions.Multinomial(total_count=shots, probs=Pn).sample()
+    return counts / shots
+
+def entropy_of_distribution(P, eps=1e-12):
+    Z = P.sum(dim=1, keepdim=True).clamp_min(eps)
+    Pn = (P / Z).clamp_min(eps)
+    return -(Pn * Pn.log()).sum(dim=1)
+
+# ---------------- Optimizer & Scheduler (Best-trial params) ----------------
+def make_optimizer(params):
+    # Best: Lion, lr=0.002453..., weight_decay=0.000621...
+    if LionOpt is None:
+        print("[warn] lion-pytorch not installed; falling back to AdamW with same lr & weight_decay.")
+        return optim.AdamW(params, lr=0.0024530549218103434, weight_decay=0.0006212571765930307)
+    return LionOpt(params, lr=0.0024530549218103434, weight_decay=0.0006212571765930307, betas=(0.9,0.99))
+
+def make_scheduler(optimizer, total_steps):
+    # Best: CosineWarmRestarts (T_0=100, T_mult=1, eta_min=3.24e-05)
+    return optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=100, T_mult=1, eta_min=3.241138007462381e-05
+    )
+
+# ---------------- Train & Eval ----------------
+def run_training():
+    # Data
+    train_loader, test_loader = make_dataloaders(batch_size=32, max_per_class=MAX_PER_CLASS, classes=classes)
+
+    # Model with best-trial structure + bias head
+    model = QConvFourChannel3q_Bias(
+        M_ch=10, M_anc=20,
+        ent_pattern="cw_fixed",
+        use_rz_anc=True, rz_period=20,
+        device=device
+    ).to(device)
+
+    optimizer = make_optimizer(model.parameters())
+    steps_per_epoch = len(train_loader)
+    total_steps = max_epochs * steps_per_epoch
+    scheduler = make_scheduler(optimizer, total_steps)
+
+    shots_label = 4427
+    lambda_entropy = 0.009220699720886544
+
+    best_acc_clean = 0.0
+    best_acc_noisy = 0.0
+    epoch_best_clean = -1
+    epoch_best_noisy = -1
+
+    for epoch in range(max_epochs):
+        model.train()
+        t0 = time.time()
+        losses = []
+
+        for xb16, yb in train_loader:
+            xb16 = xb16.to(device); yb = yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            P = model(xb16)  # [B,8]
+            if simulate_shots:
+                with torch.no_grad():
+                    P_noisy = apply_shot_noise_to_probs(P, shots=shots_label)
+                P_eff = ste(P_noisy, P)
+            else:
+                P_eff = P
+
+            logits = model.beta * (2.0 * P_eff - 1.0) + model.logit_bias
+            logp = F.log_softmax(logits, dim=1)
+            base = F.nll_loss(logp, yb)
+            H = entropy_of_distribution(P_eff).mean()
+            loss = base - lambda_entropy * H
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            scheduler.step(epoch + (len(losses)+1)/max(1,steps_per_epoch))
+            losses.append(loss.item())
+
+        # ---- Eval (clean + noisy) ----
+        model.eval(); correct_clean=0; correct_noisy=0; total=0
+        with torch.no_grad():
+            for xb16, yb in test_loader:
+                xb16 = xb16.to(device); yb = yb.to(device)
+                P_true = model(xb16)
+
+                logits_clean = model.beta * (2.0 * P_true - 1.0) + model.logit_bias
+                preds_clean = logits_clean.argmax(1)
+                correct_clean += (preds_clean == yb).sum().item()
+
+                P_noisy_eval = apply_shot_noise_to_probs(P_true, shots=shots_label)
+                logits_noisy = model.beta * (2.0 * P_noisy_eval - 1.0) + model.logit_bias
+                preds_noisy = logits_noisy.argmax(1)
+                correct_noisy += (preds_noisy == yb).sum().item()
+
+                total += yb.size(0)
+
+        acc_clean = 100.0 * correct_clean / max(1, total)
+        acc_noisy = 100.0 * correct_noisy / max(1, total)
+
+        if acc_clean > best_acc_clean + 1e-12:
+            best_acc_clean = acc_clean; epoch_best_clean = epoch + 1
+        if acc_noisy > best_acc_noisy + 1e-12:
+            best_acc_noisy = acc_noisy; epoch_best_noisy = epoch + 1
+
+        print(
+            f"Epoch {epoch+1:3d}/{max_epochs} | loss={np.mean(losses):.4f} "
+            f"| acc_clean={acc_clean:.2f}% (best {best_acc_clean:.2f}% @ {epoch_best_clean}) "
+            f"| acc_noisy={acc_noisy:.2f}% (best {best_acc_noisy:.2f}% @ {epoch_best_noisy}) "
+            f"| ent=cw_fixed | M_ch=10 M_anc=20 use_rz_anc=True rz_period=20 "
+            f"| opt=Lion | shots_lbl={shots_label} | lamH={lambda_entropy:.4f} | time={time.time()-t0:.1f}s"
+        )
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    print("\nFinal best (clean):", best_acc_clean, "@ epoch", epoch_best_clean)
+    print("Final best (noisy):", best_acc_noisy, "@ epoch", epoch_best_noisy)
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    if LionOpt is None:
+        print("Note: Install Lion for exact optimizer:  pip install lion-pytorch")
+    run_training()

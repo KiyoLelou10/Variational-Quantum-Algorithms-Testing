@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Sep 20 03:20:37 2025
+
+@author: AndrejSumShik
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 19 21:38:19 2025
+
+@author: AndrejSumShik
+"""
+
 #!/usr/bin/env python3
 # qae_mnist_best_metrics.py
 import os, math, json, time, gc, argparse
@@ -33,6 +47,22 @@ grad_clip = 5.0
 # total qubits: AB + ref + anc
 n_qubits = n_AB + n_ref + anc
 print(f"n_AB={n_AB} (A={k}, B={l}), n_ref={n_ref}, anc={anc}, total_qubits={n_qubits}")
+
+# ---- Sampling helpers ----
+def take_first_n_from_loader(dataset, batch_size, n, shuffle=True):
+    """Return a tensor of up to n samples (x only) from a dataset via a DataLoader."""
+    if n is None or n <= 0:
+        raise ValueError("n must be positive for sampling.")
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, pin_memory=True)
+    xs = []
+    cnt = 0
+    for xb, _ in loader:
+        xs.append(xb.to(device))
+        cnt += xb.size(0)
+        if cnt >= n:
+            break
+    x = torch.cat(xs, dim=0)
+    return x[:n]
 
 # ---------------- Gates ----------------
 def ry_matrix(angle):
@@ -103,7 +133,7 @@ class QAEModel(nn.Module):
         self.device = device
         self.n_AB = n_AB; self.l = l; self.k = n_AB - l
         self.n_ref = n_ref; self.anc = anc; self.M = M
-        self.ent_pattern = ent_pattern  # 'cw_fixed' or 'cw_ccw_alternating'
+        self.ent_pattern = ent_pattern  # 'cw_fixed' or anything else -> alternate
 
         self.nv = self.n_AB
         self.n_qubits = self.n_AB + self.n_ref + self.anc
@@ -142,8 +172,6 @@ class QAEModel(nn.Module):
         state = self.evolve_AB(state)               # operations affect only AB subspace
 
         # Slice out the AB amplitudes (ref and anc assumed in |0..0>)
-        # We placed AB amplitudes at indices shifted by (n_ref+anc), and ref/anc stayed |0>.
-        # So AB substate is gathered by picking those indices back:
         shift = self.n_ref + self.anc
         idxs = (torch.arange(0, 2**self.n_AB, device=self.device) << shift)
         ab_state = state.index_select(dim=1, index=idxs)   # [B, 2^n_AB]
@@ -329,7 +357,6 @@ def entanglement_entropy_bits(ab_state_vec: torch.Tensor, n_total=8, nA=4) -> Tu
     A = nA; B = n_total - nA
     psi = ab_state_vec.view(2**A, 2**B)  # real matrix (here)
     # SVD
-    # Use full_matrices=False for speed
     S = torch.linalg.svdvals(psi)
     p = (S**2)
     p = p / (p.sum() + 1e-20)
@@ -371,7 +398,7 @@ def porter_thomas_w1_kl(prob_vectors: torch.Tensor, bins=200) -> Dict[str, float
 # ---------------- Training (your best hyperparams) ----------------
 BEST = dict(
     M=48,
-    ent_pattern='cw_fixed',
+    ent_pattern='cw_alternating',  # alternates since != "cw_fixed"
     batch_size=512,
     shots_label=3247,
     lr=0.0037600731932887215,
@@ -401,12 +428,12 @@ def compute_pre_metrics_avg(
     init_modes: List[str],
     eval_loader: DataLoader,
     build_model_fn,
-    qfim_max_batches:int=1,
-    qfim_max_samples:int=4,
-    qfim_max_state_components:int=256,
-    fim_max_batches:int=2,
-    ent_max_samples:int=64,
-    haar_max_samples:int=256
+    qfim_max_batches:int=1,                # kept for signature
+    qfim_max_samples:int=32,               # ↑ (moderate)
+    qfim_max_state_components:int=256,     # full 8-qubit state
+    fim_max_batches:int=4,                 # ↑ (moderate)
+    ent_max_samples:int=128,               # decoupled; actually used
+    haar_max_samples:int=1024              # ↑ (moderate)
 ) -> Tuple[Dict[str, object], Dict[str, object], Dict[str, float], Dict[str, float]]:
     """Average pre-train metrics across multiple initializations."""
     fim_eigs = []
@@ -415,69 +442,63 @@ def compute_pre_metrics_avg(
     ent_3v5_list = []
     haar_probs_collect = []
 
+    eval_dataset = eval_loader.dataset
+
     for mode in init_modes:
         model = build_model_fn().to(device)
         reinit_params(model, mode)
 
-        # FIM (empirical)
+        # FIM (empirical): use more batches
         F = empirical_fim(model, eval_loader, max_batches=fim_max_batches)
         fim_eigs.append(eigen_spectrum_stats(F))
 
-        # QFIM: small subset for cost control
-        xb_accum = []
-        cnt = 0
-        for xb, yb in eval_loader:
-            xb = xb.to(device)
-            xb_accum.append(xb)
-            cnt += xb.shape[0]
-            if cnt >= qfim_max_samples: break
-        xb_small = torch.cat(xb_accum, dim=0)[:qfim_max_samples]
-        QF = qfim_from_state_autograd(model, xb_small, max_state_components=qfim_max_state_components)
+        # QFIM: randomized subset
+        xb_qfim = take_first_n_from_loader(
+            eval_dataset, batch_size=BEST["batch_size"], n=qfim_max_samples, shuffle=True
+        )
+        QF = qfim_from_state_autograd(model, xb_qfim, max_state_components=qfim_max_state_components)
         qfim_eigs.append(eigen_spectrum_stats(QF))
 
-        # Entanglement entropies (AB 8 qubits)
+        # Entanglement (decoupled from QFIM)
         with torch.no_grad():
-            # grab some states
-            xb_e = xb_small[:ent_max_samples]
-            _, ab_states = model.forward_with_state(xb_e)
-            for i in range(min(ent_max_samples, ab_states.shape[0])):
+            xb_ent = take_first_n_from_loader(
+                eval_dataset, batch_size=BEST["batch_size"], n=ent_max_samples, shuffle=True
+            )
+            _, ab_states = model.forward_with_state(xb_ent)
+            for i in range(ab_states.shape[0]):
                 s = ab_states[i]
-                Sn_nat, Sn_bit = entanglement_entropy_bits(s, n_total=8, nA=4)    # 4|4
-                ent_44_list.append(Sn_bit)
-                # B(3) vs A(5): arrange as nA=3
-                Sn_nat2, Sn_bit2 = entanglement_entropy_bits(s, n_total=8, nA=3)  # 3|5
-                ent_3v5_list.append(Sn_bit2)
+                _, Sb4 = entanglement_entropy_bits(s, n_total=8, nA=4)  # 4|4
+                _, Sb3 = entanglement_entropy_bits(s, n_total=8, nA=3)  # 3|5
+                ent_44_list.append(Sb4)
+                ent_3v5_list.append(Sb3)
 
-            # Haar / Porter–Thomas: collect probabilities across more samples
-            cnt_h = 0
+            # Haar / Porter–Thomas: aggregate over more samples
             probs_all = []
-            for xb, _ in eval_loader:
+            taken = 0
+            for xb, _ in DataLoader(eval_dataset, batch_size=BEST["batch_size"], shuffle=True, pin_memory=True):
                 xb = xb.to(device)
                 probs, ab = model.forward_with_state(xb)
-                # Use measurement probs over the full AB register (not just B)
-                # -> build |ψ|^2 over AB components:
                 ab_probs = (ab ** 2)  # [B, 256]
                 probs_all.append(ab_probs.detach())
-                cnt_h += xb.shape[0]
-                if cnt_h >= haar_max_samples: break
-            PAB = torch.cat(probs_all, dim=0)
+                taken += xb.size(0)
+                if taken >= haar_max_samples:
+                    break
+            PAB = torch.cat(probs_all, dim=0)[:haar_max_samples]
             haar_stats = porter_thomas_w1_kl(PAB)
             haar_probs_collect.append(haar_stats)
 
         del model
         gc.collect()
-        if device.type == "cuda": torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # average dictionaries
     def avg_spec(specs: List[Dict[str, object]]) -> Dict[str, object]:
-        # average scalars; keep eigs from the first for brevity but also average trace/summaries
         if not specs: return {}
         keys = ["trace","sum_sq","erank_quadratic","erank_entropy"]
         out = {k: float(np.mean([s[k] for s in specs])) for k in keys}
-        # average deff per gamma
         gammas = list(specs[0]["deff"].keys())
         out["deff"] = {g: float(np.mean([s["deff"][g] for s in specs])) for g in gammas}
-        # include one eigen spectrum snapshot (first)
         out["eigs"] = specs[0]["eigs"]
         return out
 
@@ -496,34 +517,37 @@ def compute_pre_metrics_avg(
 def compute_post_metrics(
     model: QAEModel,
     eval_loader: DataLoader,
-    qfim_max_samples:int=4,
+    qfim_max_samples:int=32,               # ↑
     qfim_max_state_components:int=256,
-    fim_max_batches:int=2,
-    ent_max_samples:int=64
+    fim_max_batches:int=4,                 # ↑
+    ent_max_samples:int=128                # decoupled
 ) -> Tuple[Dict[str, object], Dict[str, object], Dict[str, float]]:
+    eval_dataset = eval_loader.dataset
+
     # FIM
     F = empirical_fim(model, eval_loader, max_batches=fim_max_batches)
     post_fim = eigen_spectrum_stats(F)
+
     # QFIM
-    xb_accum = []
-    cnt = 0
-    for xb, yb in eval_loader:
-        xb = xb.to(device)
-        xb_accum.append(xb)
-        cnt += xb.shape[0]
-        if cnt >= qfim_max_samples: break
-    xb_small = torch.cat(xb_accum, dim=0)[:qfim_max_samples]
-    QF = qfim_from_state_autograd(model, xb_small, max_state_components=qfim_max_state_components)
+    xb_qfim = take_first_n_from_loader(
+        eval_dataset, batch_size=BEST["batch_size"], n=qfim_max_samples, shuffle=True
+    )
+    QF = qfim_from_state_autograd(model, xb_qfim, max_state_components=qfim_max_state_components)
     post_qfim = eigen_spectrum_stats(QF)
-    # Entanglement
+
+    # Entanglement (decoupled)
     with torch.no_grad():
-        _, ab_states = model.forward_with_state(xb_small[:ent_max_samples])
+        xb_ent = take_first_n_from_loader(
+            eval_dataset, batch_size=BEST["batch_size"], n=ent_max_samples, shuffle=True
+        )
+        _, ab_states = model.forward_with_state(xb_ent)
         ent_44 = []; ent_3v5=[]
         for i in range(ab_states.shape[0]):
             s = ab_states[i]
             _, Sb4 = entanglement_entropy_bits(s, n_total=8, nA=4)
             _, Sb3 = entanglement_entropy_bits(s, n_total=8, nA=3)
             ent_44.append(Sb4); ent_3v5.append(Sb3)
+
     post_ents = {
         "S_bits_4v4_mean": float(np.mean(ent_44)) if ent_44 else 0.0,
         "S_bits_3v5_mean": float(np.mean(ent_3v5)) if ent_3v5 else 0.0,
@@ -550,11 +574,11 @@ def train_once(dataset_name: str) -> MetricBundle:
         test_loader,  # evaluation loader is fine for pre-metrics
         build_model_fn=build_model,
         qfim_max_batches=1,
-        qfim_max_samples=4,
+        qfim_max_samples=32,
         qfim_max_state_components=256,
-        fim_max_batches=2,
-        ent_max_samples=64,
-        haar_max_samples=512
+        fim_max_batches=4,
+        ent_max_samples=128,
+        haar_max_samples=1024
     )
 
     # ---- Model for training (use your best init std=0.08) ----
@@ -617,10 +641,10 @@ def train_once(dataset_name: str) -> MetricBundle:
     # ---- POST: metrics on trained weights ----
     post_fim, post_qfim, post_ents = compute_post_metrics(
         model, test_loader,
-        qfim_max_samples=4,
+        qfim_max_samples=32,
         qfim_max_state_components=256,
-        fim_max_batches=2,
-        ent_max_samples=64
+        fim_max_batches=4,
+        ent_max_samples=128
     )
 
     return MetricBundle(
@@ -649,13 +673,13 @@ def main():
         mb = train_once(ds)
         out = asdict(mb)
         all_results[ds] = out
-        out_path = os.path.join(args.outdir, f"results_{ds}.json")
+        out_path = os.path.join(args.outdir, f"results2_{ds}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
         print(f"\nSaved metrics -> {out_path}")
 
     # also dump a combined file
-    combo = os.path.join(args.outdir, "results_ALL.json")
+    combo = os.path.join(args.outdir, "results2_ALL.json")
     with open(combo, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved combined metrics -> {combo}")
